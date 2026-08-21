@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Internal Sparse-MLA paged attention implementation for SM120.
+"""Internal Sparse-MLA paged attention implementation for SM89/SM120/SM121.
 
 Auto-dispatches between decode (num_tokens <= 64) and prefill (larger). Both
 DSv3.2 (d_qk=576) and DSv4 (d_qk=512) decode go through dedicated warp-spec
@@ -43,6 +43,7 @@ tests/benchmarks.
 from __future__ import annotations
 
 import functools
+import logging
 import os
 from types import SimpleNamespace
 from typing import List, Optional
@@ -59,6 +60,7 @@ from ..autotuner import (
 )
 from ..jit.mla import gen_sparse_mla_sm120_module
 from ..utils import (
+    get_compute_capability,
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
@@ -72,6 +74,8 @@ _BI = 64  # KV partition tile size in candidates (BLOCK_SIZE_N)
 # Decode/prefill cutoff: num_tokens > _DECODE_MAX_TOKENS routes to the
 # prefill orchestrator; otherwise to the standalone decode kernels.
 _DECODE_MAX_TOKENS = 64
+
+logger = logging.getLogger(__name__)
 
 # decode-dsv4 instantiation set. Shapes outside this table fall through to
 # decode-dsv3_2 / prefill. NH=8 is the small-TP corner case; the kernel pads
@@ -176,6 +180,42 @@ def _bytes_per_token_for_model_type(model_type: int) -> int:
     if model_type == _MODEL_TYPE_DSV4:
         return _BPT_DSV4
     raise ValueError(f"Unsupported SM120 sparse-MLA model_type={model_type}")
+
+
+def _sparse_mla_arch_tag(device: torch.device) -> str:
+    major, minor = get_compute_capability(device)
+    return f"sm{major}{minor}"
+
+
+def _sparse_mla_cache_signature(
+    *,
+    device: torch.device,
+    kv_cache: torch.Tensor,
+    model_type: int,
+    extra_kv_cache: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    main_page_block_size = _packed_kv_page_block_size(
+        kv_cache,
+        model_type=model_type,
+        name="kv_cache",
+    )
+    extra_page_block_size = (
+        _packed_kv_page_block_size(
+            extra_kv_cache,
+            model_type=model_type,
+            name="extra_kv_cache",
+        )
+        if extra_kv_cache is not None
+        else 0
+    )
+    cc_major, cc_minor = get_compute_capability(device)
+    # CPU tensor: only used as a cache-key extra (consumed via .tolist()).
+    # A CUDA tensor here triggers a host->device copy, which is illegal
+    # during CUDA graph capture.
+    return torch.tensor(
+        [cc_major * 10 + cc_minor, main_page_block_size, extra_page_block_size],
+        dtype=torch.int32,
+    )
 
 
 def _packed_kv_page_block_size(
@@ -399,7 +439,7 @@ def get_sparse_mla_sm120_module():
     return SimpleNamespace(paged_attention=_paged_attention)
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([89, 120, 121])
 def _sparse_mla_sm120_paged_attention(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -418,7 +458,7 @@ def _sparse_mla_sm120_paged_attention(
     mid_out: Optional[torch.Tensor] = None,
     mid_lse: Optional[torch.Tensor] = None,
 ) -> None:
-    r"""Internal Sparse-MLA paged attention on SM120.
+    r"""Internal Sparse-MLA paged attention on SM89/SM120/SM121.
 
     Auto-dispatches decode (``num_tokens <= 64``) vs prefill (larger).
     Mutates ``output`` and ``out_lse`` in place.
@@ -482,7 +522,8 @@ def _sparse_mla_sm120_paged_attention(
 
     Notes
     -----
-    Requires SM120a / SM121a (block-scaled MXFP8 MMA + cp.async.bulk TMA).
+    Requires SM89, SM120a, or SM121a. SM89 uses compatibility shims for the
+    block-scaled FP8 MMA and bulk-copy primitives used natively on SM12x.
     """
     _require_d_v_512(d_v)
     _check_last_dim_512(output, "output")
@@ -509,7 +550,7 @@ def _sparse_mla_sm120_paged_attention(
 
 
 class _SparseMLAPagedAttentionRunner:
-    """Sparse-MLA paged attention implementation runner for SM120.
+    """Sparse-MLA paged attention implementation runner for SM89/SM120/SM121.
 
     ``max_num_tokens`` and ``max_num_heads`` are optional upper bounds. When
     both are provided, the wrapper pre-allocates its LSE buffer. Otherwise, the
@@ -540,7 +581,7 @@ class _SparseMLAPagedAttentionRunner:
     >>> runner.run(q, kv_cache, indices, output, sm_scale=...)
     """
 
-    @supported_compute_capability([120, 121])
+    @supported_compute_capability([89, 120, 121])
     def __init__(
         self,
         max_num_tokens: Optional[int] = None,
@@ -743,10 +784,12 @@ class _SparseMlaDecodeDsv3Runner(TunableRunner):
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         topk_length = inputs[6] if len(inputs) > 6 else None
         attn_sink = inputs[7] if len(inputs) > 7 else None
+        cache_signature = tuple(int(x) for x in inputs[8].tolist())
         return (
             self.model_type,
             topk_length is not None,
             attn_sink is not None,
+            cache_signature,
         )
 
     def get_valid_tactics(
@@ -817,12 +860,14 @@ def _get_sparse_mla_decode_dsv4_module():
             attn_sink = inputs[7] if len(inputs) > 7 else None
             extra_indices = inputs[8] if len(inputs) > 8 else None
             extra_topk_length = inputs[9] if len(inputs) > 9 else None
+            cache_signature = tuple(int(x) for x in inputs[10].tolist())
             extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
             return (
                 topk_length is not None,
                 attn_sink is not None,
                 int(extra_topk),
                 extra_topk_length is not None,
+                cache_signature,
             )
 
         def get_valid_tactics(
@@ -1011,7 +1056,7 @@ def _decode_dsv4_runner_singleton():
     return _get_sparse_mla_decode_dsv4_module().runner_cls()
 
 
-def _decode_dsv3_2_default_cache_path():
+def _decode_dsv3_2_default_cache_path(device: torch.device):
     """Default disk path for the decode-dsv3_2 AutoTuner cache."""
     import pathlib
 
@@ -1022,10 +1067,10 @@ def _decode_dsv3_2_default_cache_path():
         from ..jit.env import FLASHINFER_WORKSPACE_DIR
 
         base = FLASHINFER_WORKSPACE_DIR / "autotune"
-    return base / "sparse_mla_sm120_decode_dsv3_2.json"
+    return base / f"sparse_mla_{_sparse_mla_arch_tag(device)}_decode_dsv3_2.json"
 
 
-def _decode_dsv4_default_cache_path():
+def _decode_dsv4_default_cache_path(device: torch.device):
     """Default disk path for the decode-dsv4 AutoTuner cache.
 
     Override via ``FLASHINFER_AUTOTUNE_DIR`` env var or pass an explicit
@@ -1040,11 +1085,11 @@ def _decode_dsv4_default_cache_path():
         from ..jit.env import FLASHINFER_WORKSPACE_DIR
 
         base = FLASHINFER_WORKSPACE_DIR / "autotune"
-    return base / "sparse_mla_sm120_decode_dsv4.json"
+    return base / f"sparse_mla_{_sparse_mla_arch_tag(device)}_decode_dsv4.json"
 
 
-_decode_dsv3_2_cache_mtime: float = -1.0
-_decode_dsv4_cache_mtime: float = -1.0
+_decode_dsv3_2_cache_mtimes: dict[str, float] = {}
+_decode_dsv4_cache_mtimes: dict[str, float] = {}
 
 # Per-process hot cache mapping shape signature → cpb tactic. Skips
 # AutoTuner.choose_one on the steady-state path; entries are refreshed
@@ -1053,48 +1098,48 @@ _decode_dsv3_2_hot_cache: dict = {}
 _decode_dsv4_hot_cache: dict = {}
 
 
-def _decode_dsv3_2_maybe_load_cache() -> None:
+def _decode_dsv3_2_maybe_load_cache(device: torch.device) -> None:
     """Mtime-gated lazy load of the default dsv3_2 decode AutoTuner cache."""
-    global _decode_dsv3_2_cache_mtime
-    path = _decode_dsv3_2_default_cache_path()
+    path = _decode_dsv3_2_default_cache_path(device)
+    path_key = str(path)
     try:
         mtime = path.stat().st_mtime
     except OSError:
         return
-    if mtime <= _decode_dsv3_2_cache_mtime:
+    if mtime <= _decode_dsv3_2_cache_mtimes.get(path_key, -1.0):
         return
     try:
         AutoTuner.get().load_configs(str(path))
-        _decode_dsv3_2_cache_mtime = mtime
+        _decode_dsv3_2_cache_mtimes[path_key] = mtime
     except Exception:
         # Keep mtime unchanged so the next cold call retries.
         pass
 
 
-def _decode_dsv4_maybe_load_cache() -> None:
+def _decode_dsv4_maybe_load_cache(device: torch.device) -> None:
     """Mtime-gated lazy load of the default disk cache.
 
     Silent on missing file or load failure (version mismatch, corrupt JSON):
     falls back to the C++ heuristic via AutoTuner's normal fallback path so
     a bad cache never blocks serving.
     """
-    global _decode_dsv4_cache_mtime
-    path = _decode_dsv4_default_cache_path()
+    path = _decode_dsv4_default_cache_path(device)
+    path_key = str(path)
     try:
         mtime = path.stat().st_mtime
     except OSError:
         return
-    if mtime <= _decode_dsv4_cache_mtime:
+    if mtime <= _decode_dsv4_cache_mtimes.get(path_key, -1.0):
         return
     try:
         AutoTuner.get().load_configs(str(path))
-        _decode_dsv4_cache_mtime = mtime
+        _decode_dsv4_cache_mtimes[path_key] = mtime
     except Exception:
         # Keep mtime unchanged so the next cold call retries.
         pass
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([89, 120, 121])
 def sparse_mla_sm120_decode_dsv3_2(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1110,7 +1155,7 @@ def sparse_mla_sm120_decode_dsv3_2(
     model_type: int = _MODEL_TYPE_DSV3_2,
     chunks_per_block: Optional[int] = None,
 ) -> torch.Tensor:
-    """Sparse-MLA paged decode (DSv3.2 / GLM-NSA kernel) on SM120.
+    """Sparse-MLA paged decode (DSv3.2 / GLM-NSA kernel) on SM89/SM120/SM121.
 
     ``chunks_per_block`` follows the same contract as the DSv4 decode helper:
     explicit values bypass AutoTuner; otherwise a tuned/cache tactic is used
@@ -1119,6 +1164,11 @@ def sparse_mla_sm120_decode_dsv3_2(
     _check_last_dim_512(output, "output")
     _check_last_dim_512(mid_out, "mid_out")
 
+    cache_signature = _sparse_mla_cache_signature(
+        device=q.device,
+        kv_cache=kv_cache,
+        model_type=int(model_type),
+    )
     runner = _decode_dsv3_2_runner_singleton(int(model_type))
     inputs = [
         q,
@@ -1129,6 +1179,7 @@ def sparse_mla_sm120_decode_dsv3_2(
         out_lse,
         topk_length,
         attn_sink,
+        cache_signature,
     ]
 
     forward_kwargs = {
@@ -1164,7 +1215,7 @@ def sparse_mla_sm120_decode_dsv3_2(
             )
             return output
 
-    _decode_dsv3_2_maybe_load_cache()
+    _decode_dsv3_2_maybe_load_cache(q.device)
     chosen, tactic = tuner.choose_one(
         "sparse_mla_sm120_decode_dsv3_2",
         [runner],
@@ -1187,7 +1238,7 @@ def sparse_mla_sm120_decode_dsv3_2(
     return output
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([89, 120, 121])
 def sparse_mla_sm120_decode_dsv4(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1205,7 +1256,7 @@ def sparse_mla_sm120_decode_dsv4(
     extra_topk_length: Optional[torch.Tensor] = None,
     chunks_per_block: Optional[int] = None,
 ) -> torch.Tensor:
-    r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
+    r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM89/SM120/SM121.
 
     The decode-dsv4 path is the split-K decode variant where each block handles
     ``chunks_per_block`` chunks of 64 candidates each. The wall-time-optimal
@@ -1254,6 +1305,12 @@ def sparse_mla_sm120_decode_dsv4(
     _check_last_dim_512(output, "output")
     _check_last_dim_512(mid_out, "mid_out")
 
+    cache_signature = _sparse_mla_cache_signature(
+        device=q.device,
+        kv_cache=kv_cache,
+        model_type=_MODEL_TYPE_DSV4,
+        extra_kv_cache=extra_kv_cache,
+    )
     runner = _decode_dsv4_runner_singleton()
     inputs = [
         q,
@@ -1266,6 +1323,7 @@ def sparse_mla_sm120_decode_dsv4(
         attn_sink,
         extra_indices,
         extra_topk_length,
+        cache_signature,
     ]
 
     forward_kwargs = {
@@ -1310,7 +1368,7 @@ def sparse_mla_sm120_decode_dsv4(
             return output
 
     # Cold path: lazy-load the disk cache once, then resolve via AutoTuner.
-    _decode_dsv4_maybe_load_cache()
+    _decode_dsv4_maybe_load_cache(q.device)
     chosen, tactic = tuner.choose_one(
         "sparse_mla_sm120_decode_dsv4",
         [runner],

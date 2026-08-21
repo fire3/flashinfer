@@ -61,18 +61,32 @@ __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
 }
 
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
+#if SPARSE_MLA_USE_SM89_PRIMS
+  (void)mbar;
+  (void)tx_bytes;
+#else
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
   asm volatile(
       "{\n .reg .b64 state;\n"
       " mbarrier.arrive.expect_tx.shared::cta.b64 state, [%0], %1;\n"
       "}\n" ::"r"(addr),
       "r"(tx_bytes));
+#endif
 }
 
 __device__ __forceinline__ void mbarrier_wait_parity(uint64_t* mbar, uint32_t phase) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
   uint32_t done = 0;
   while (!done) {
+#if SPARSE_MLA_USE_SM89_PRIMS
+    asm volatile(
+        "{\n .reg .pred p;\n"
+        " mbarrier.test_wait.parity.shared.b64 p, [%1], %2;\n"
+        " selp.u32 %0, 1, 0, p;\n"
+        "}\n"
+        : "=r"(done)
+        : "r"(addr), "r"(phase));
+#else
     asm volatile(
         "{\n .reg .pred p;\n"
         " mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
@@ -80,5 +94,6 @@ __device__ __forceinline__ void mbarrier_wait_parity(uint64_t* mbar, uint32_t ph
         "}\n"
         : "=r"(done)
         : "r"(addr), "r"(phase));
+#endif
   }
 }

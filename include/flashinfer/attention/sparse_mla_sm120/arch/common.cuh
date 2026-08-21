@@ -38,6 +38,12 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define SPARSE_MLA_USE_SM89_PRIMS 1
+#else
+#define SPARSE_MLA_USE_SM89_PRIMS 0
+#endif
+
 using bf16 = __nv_bfloat16;
 using fp8 = __nv_fp8_e4m3;
 using bf16_2 = __nv_bfloat162;

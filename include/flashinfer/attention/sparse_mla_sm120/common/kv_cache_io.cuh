@@ -91,6 +91,14 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
     else
       cp_async_bulk_g2s(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar);
   }
+#if SPARSE_MLA_USE_SM89_PRIMS
+  // SM89: expect_tx is a no-op and cp.async.mbarrier.arrive.noinc traps in
+  // this context, so fall back to the decode-style completion: wait for the
+  // IO threads' copies, sync the IO threads, then arrive once (count=1).
+  cp_async_wait_all();
+  bar_sync_t<4, IO_THREADS>();
+  if (io_tid == 0) mbarrier_arrive(mbar);
+#endif
 }
 
 template <ModelType MT, int PAGE_BLOCK_SIZE>

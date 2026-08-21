@@ -47,6 +47,17 @@ struct MmaBf16Result {
   float d0, d1, d2, d3;
 };
 
+__device__ __forceinline__ float multiply_ue8m0(uint32_t a, uint32_t b) {
+  const int biased_exp = static_cast<int>(a) + static_cast<int>(b) - 127;
+  if (__builtin_expect(a != 0xff && b != 0xff && biased_exp > 0 && biased_exp < 255, 1)) {
+    return __uint_as_float(static_cast<uint32_t>(biased_exp) << 23);
+  }
+  if (a == 0xff || b == 0xff) return __uint_as_float(0x7fc00000);
+  if (biased_exp >= 255) return __uint_as_float(0x7f800000);
+  if (biased_exp < -22) return 0.f;
+  return __uint_as_float(1u << (biased_exp + 22));
+}
+
 __device__ __forceinline__ MmaFp8Result mma_fp8_m16n8k32(uint32_t a0, uint32_t a1, uint32_t a2,
                                                          uint32_t a3, uint32_t b0, uint32_t b1,
                                                          float c0, float c1, float c2, float c3) {
@@ -62,6 +73,24 @@ __device__ __forceinline__ MmaFp8Result mma_fp8_m16n8k32(uint32_t a0, uint32_t a
 __device__ __forceinline__ MmaFp8Result mma_fp8_block_scaled_m16n8k32(
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1, float c0,
     float c1, float c2, float c3, uint8_t scale_a, uint8_t scale_b) {
+#if SPARSE_MLA_USE_SM89_PRIMS
+  MmaFp8Result mma = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, 0.f, 0.f, 0.f, 0.f);
+  const int lane = threadIdx.x & 31;
+  const int quad_base = lane & ~3;
+  const int col_pair = lane & 3;
+
+  const uint32_t sa0 = __shfl_sync(0xffffffff, static_cast<uint32_t>(scale_a), quad_base);
+  const uint32_t sa1 = __shfl_sync(0xffffffff, static_cast<uint32_t>(scale_a), quad_base + 1);
+  const uint32_t sb0 = __shfl_sync(0xffffffff, static_cast<uint32_t>(scale_b), col_pair * 8);
+  const uint32_t sb1 = __shfl_sync(0xffffffff, static_cast<uint32_t>(scale_b), col_pair * 8 + 4);
+
+  return MmaFp8Result{
+      fmaf(mma.d0, multiply_ue8m0(sa0, sb0), c0),
+      fmaf(mma.d1, multiply_ue8m0(sa0, sb1), c1),
+      fmaf(mma.d2, multiply_ue8m0(sa1, sb0), c2),
+      fmaf(mma.d3, multiply_ue8m0(sa1, sb1), c3),
+  };
+#else
   MmaFp8Result r;
   asm volatile(
       "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32"
@@ -74,6 +103,7 @@ __device__ __forceinline__ MmaFp8Result mma_fp8_block_scaled_m16n8k32(
         "n"(static_cast<uint16_t>(0)), "r"(static_cast<uint32_t>(scale_b)),
         "n"(static_cast<uint16_t>(0)), "n"(static_cast<uint16_t>(0)));
   return r;
+#endif
 }
 
 __device__ __forceinline__ MmaBf16Result mma_bf16_m16n8k16(uint32_t a0, uint32_t a1, uint32_t a2,

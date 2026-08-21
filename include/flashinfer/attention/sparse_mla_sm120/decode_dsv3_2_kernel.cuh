@@ -230,9 +230,13 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     uint8_t* kv_fp8_dst = sm.kv_fp8(buf);
     bf16* kv_rope_dst = sm.kv_rope(buf);
 
+#if SPARSE_MLA_USE_SM89_PRIMS
+    // expect_tx is a no-op on SM89; the arrive is issued after the copies.
+#else
     if (lane == 0) {
       mbarrier_arrive_expect_tx(sm.mbar_full(buf), V2_BULK_TX_BYTES);
     }
+#endif
 
 #pragma unroll
     for (int eo = 0; eo < DSV3_2_BI; eo += DSV3_2_IO_THREADS) {
@@ -252,6 +256,15 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + KV_ROPE_OFFSET,
                         V2_BULK_ROPE_BYTES, sm.mbar_full(buf));
     }
+#if SPARSE_MLA_USE_SM89_PRIMS
+    // cp.async emulation has no mbarrier tx tracking: wait for the IO warp's
+    // copies, then arrive once so the math side can proceed.
+    cp_async_wait_all();
+    bar_sync_t<4, DSV3_2_IO_THREADS>();
+    if (lane == 0) {
+      mbarrier_arrive(sm.mbar_full(buf));
+    }
+#endif
   };
 
   if (is_io) {
