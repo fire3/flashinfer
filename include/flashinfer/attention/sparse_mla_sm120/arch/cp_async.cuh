@@ -49,7 +49,13 @@ __device__ __forceinline__ void cp_async_16B(void* smem_ptr, const void* gmem_pt
 
 __device__ __forceinline__ void cp_async_16B_l2(void* smem_ptr, const void* gmem_ptr) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#if SPARSE_MLA_USE_SM89_PRIMS
+  // L2::128B hint is illegal on SM89 (illegal memory access); plain
+  // cp.async is functionally equivalent (just loses the cache hint).
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(addr), "l"(gmem_ptr));
+#else
   asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::"r"(addr), "l"(gmem_ptr));
+#endif
 }
 
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
@@ -60,27 +66,51 @@ __device__ __forceinline__ void cp_async_wait_group() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
+__device__ __forceinline__ void cp_async_mbarrier_arrive_noinc(uint64_t* mbar) {
+  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(addr) : "memory");
+}
+
 // cp.async.bulk: SM90+ bulk global → shared (mbarrier-based completion)
 __device__ __forceinline__ void cp_async_bulk_g2s(void* smem_dst, const void* gmem_src,
                                                   uint32_t bytes, uint64_t* mbar) {
+#if SPARSE_MLA_USE_SM89_PRIMS
+  (void)mbar;
+#pragma unroll
+  for (uint32_t off = 0; off < bytes; off += 16) {
+    cp_async_16B(static_cast<uint8_t*>(smem_dst) + off,
+                 static_cast<const uint8_t*>(gmem_src) + off);
+  }
+#else
   uint32_t dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
   uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
   asm volatile(
       "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
       " [%0], [%1], %2, [%3];\n" ::"r"(dst_addr),
       "l"(gmem_src), "r"(bytes), "r"(mbar_addr));
+#endif
 }
 
 // cp.async.bulk with L2 cache hint (evict_first for streaming KV data)
 __device__ __forceinline__ void cp_async_bulk_g2s_l2hint(void* smem_dst, const void* gmem_src,
                                                          uint32_t bytes, uint64_t* mbar,
                                                          uint64_t cache_policy) {
+#if SPARSE_MLA_USE_SM89_PRIMS
+  (void)mbar;
+  (void)cache_policy;
+#pragma unroll
+  for (uint32_t off = 0; off < bytes; off += 16) {
+    cp_async_16B_l2(static_cast<uint8_t*>(smem_dst) + off,
+                    static_cast<const uint8_t*>(gmem_src) + off);
+  }
+#else
   uint32_t dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
   uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
   asm volatile(
       "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
       " [%0], [%1], %2, [%3], %4;\n" ::"r"(dst_addr),
       "l"(gmem_src), "r"(bytes), "r"(mbar_addr), "l"(cache_policy));
+#endif
 }
 
 // Create L2 evict-first cache policy (streaming data consumed once)

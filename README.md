@@ -17,6 +17,11 @@ High-Performance GPU Kernels for Inference
 
 **FlashInfer** is a library and kernel generator for inference that delivers state-of-the-art performance across diverse GPU architectures. It provides unified APIs for attention, GEMM, and MoE operations with multiple backend implementations including FlashAttention-2/3, cuDNN, CUTLASS, and TensorRT-LLM.
 
+> **Fork 说明（`v0.6.16.post3-dev-sm89-dsv4`）**：本分支在 v0.6.16.post3
+> 基础上为 DeepSeek V4 (Flash) 稀疏 MLA 提供 SM89 (NVIDIA Ada) 支持，与
+> vLLM 的 `v0.27.0-dsv4-sm89` 分支配套。移植说明见
+> [README_SM89.md](README_SM89.md)。
+
 ## Why FlashInfer?
 
 - **State-of-the-art Performance**: Optimized kernels for prefill, decode, and mixed batching scenarios

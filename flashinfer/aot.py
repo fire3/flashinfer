@@ -497,6 +497,7 @@ def gen_all_modules(
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
     has_sm80 = sm_capabilities.get("sm80", False)
+    has_sm89 = sm_capabilities.get("sm89", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_sm100f = sm_capabilities.get("sm100f", False)
@@ -776,8 +777,8 @@ def gen_all_modules(
             )
         )
 
-    # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
-    if has_sm120 or has_sm121:
+    # Sparse-MLA paged attention (DSv4 + DSv3.2 / GLM5.1) for SM89/SM120 family.
+    if has_sm89 or has_sm120 or has_sm121:
         jit_specs.append(gen_sparse_mla_sm120_module())
 
     # Add cuDNN FMHA module
@@ -884,6 +885,31 @@ def compile_and_package_modules(
     # Generate JIT specs
     if verbose:
         print("Generating JIT specs...")
+    # Modules gated behind SM90+ kernels (MoE/GEMM, comm, XQA) cannot compile
+    # for an SM8x-only AOT build, so disable them when no SM90+ arch is in
+    # FLASHINFER_CUDA_ARCH_LIST. Those kernels still work via runtime JIT.
+    has_sm90_plus = any(
+        sm_capabilities.get(sm_name)
+        for sm_name in (
+            "sm90",
+            "sm100",
+            "sm100f",
+            "sm103",
+            "sm110",
+            "sm120",
+            "sm120f",
+            "sm121",
+        )
+    )
+    if not has_sm90_plus:
+        for key in ("add_moe", "add_comm", "add_xqa"):
+            if config.get(key):
+                config[key] = False
+                print(
+                    "AOT: disabled "
+                    f"{key} (requires SM90+; not in "
+                    f"FLASHINFER_CUDA_ARCH_LIST={os.environ['FLASHINFER_CUDA_ARCH_LIST']})"
+                )
     jit_specs = gen_all_modules(
         config["f16_dtype"],
         config["f8_dtype"],
@@ -967,6 +993,7 @@ def detect_sm_capabilities():
     has_any_sm8x = any(major == 8 for major, _ in compilation_context.TARGET_CUDA_ARCHS)
     return {
         "sm80": has_any_sm8x and get_cuda_version() >= Version("11.0"),
+        "sm89": has_sm("compute_89", "11.8"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100f": has_sm("compute_100", "12.9"),

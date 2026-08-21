@@ -378,9 +378,13 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     return_lse: bool,
     kv_scale_format: str,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if not is_sm12x_supported(query.device):
+    if not (
+        is_sm12x_supported(query.device)
+        or get_compute_capability(query.device) == (8, 9)
+    ):
         raise ValueError(
-            "SM120 sparse MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+            "SM120 sparse MLA requires SM89, SM120a (CUDA >= 12.8), "
+            "or SM121a (CUDA >= 13.0)"
         )
     if query.ndim != 4:
         raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
@@ -1037,14 +1041,35 @@ def _check_dsv4_sparse_mla_inputs(
 
 def _resolve_dsv4_sparse_mla_backend(device: torch.device) -> str:
     cc = get_compute_capability(device)
-    if cc[0] == 12:
+    if cc[0] == 12 or cc == (8, 9):
         return "sparse"
     if cc[0] == 10:
         return "trtllm-gen"
     raise ValueError(
         "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
-        f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
+        "TRTLLM-GEN or SM89/SM120/SM121 via sparse backend, "
+        f"got SM{cc[0]}{cc[1]}"
     )
+
+
+def _resolve_batch_decode_mla_backend(
+    device: torch.device,
+    *,
+    requested_backend: str,
+    sparse_mla_top_k: int,
+) -> str:
+    if requested_backend != "auto":
+        return requested_backend
+
+    cc = get_compute_capability(device)
+    if sparse_mla_top_k > 0:
+        if cc[0] == 12 or cc == (8, 9):
+            return "sparse"
+        if cc[0] == 10:
+            return "trtllm-gen"
+    if cc[0] != 10:
+        return "xqa"
+    return "auto"
 
 
 def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
@@ -2935,27 +2960,26 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
+    r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM89/SM120/SM121 sparse kernels.
 
     With ``backend="auto"``, SM100/SM103 devices use TRTLLM-GEN for sparse MLA
-    when ``sparse_mla_top_k > 0``. SM120/SM121 devices use the packed sparse
-    backend for ``sparse_mla_top_k > 0`` and XQA for dense decode.
+    when ``sparse_mla_top_k > 0``. SM89/SM120/SM121 devices use the packed
+    sparse backend for ``sparse_mla_top_k > 0`` and XQA for dense decode.
 
     Parameters
     ----------
     query : torch.Tensor
         Query tensor with shape
         ``[batch_size, q_len_per_request, num_heads, head_dim_qk]`` where
-        ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``. When
-        ``cum_seq_lens_q`` is provided, TRTLLM-GEN and monolithic CuTeDSL
+        ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``. For the SM89/SM120/SM121
+        v32/GLM sparse backend, this must be BF16 with ``head_dim_qk == 576``.
+        When ``cum_seq_lens_q`` is provided, TRTLLM-GEN and monolithic CuTeDSL
         instead accept compact ``[total_q, num_heads, head_dim_qk]`` input.
-        For the SM120/SM121 v32/GLM sparse backend, this must be BF16 with
-        ``head_dim_qk == 576``.
     kv_cache : torch.Tensor
         For TRTLLM-GEN, CuteDSL, and XQA, the paged KV cache is
         ``[num_pages, page_size, kv_lora_rank + qk_rope_head_dim]`` or
         ``[num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim]`` and uses
-        the query-compatible dense dtype. For the SM120/SM121 v32/GLM sparse
+        the query-compatible dense dtype. For the SM89/SM120/SM121 v32/GLM sparse
         backend, this is a packed uint8 cache with 656 bytes per token, shaped
         ``[num_pages, page_size, 656]`` or ``[num_pages, 1, page_size, 656]``.
     workspace_buffer : torch.Tensor
@@ -2963,10 +2987,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         by kernels that use semaphore state.
     qk_nope_head_dim : int
         Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
-        ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
+        ``64`` depending on model. The SM89/SM120/SM121 sparse v32/GLM backend
         ignores this value and validates ``query.shape[-1] == 576`` instead.
     kv_lora_rank : int
-        Latent KV rank. TRTLLM-GEN and SM120/SM121 sparse v32/GLM use ``512``.
+        Latent KV rank. TRTLLM-GEN and SM89/SM120/SM121 sparse v32/GLM use ``512``.
     qk_rope_head_dim : int
         RoPE head dimension. Sparse MLA paths use ``64``; the native
         no-RoPE TRTLLM-GEN path (``kv_lora_rank=512``) uses ``0``.
@@ -2976,7 +3000,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When ``cum_seq_lens_q`` is provided with sparse MLA, pass compact
         sparse rows in flattened query-token order with shape
         ``[total_q, sparse_mla_top_k]``.
-        For SM120/SM121 sparse v32/GLM, it is the sparse index matrix and must
+        For SM89/SM120/SM121 sparse v32/GLM, it is the sparse index matrix and must
         have shape ``[batch_size, q_len_per_request, sparse_mla_top_k]`` with
         int32 physical token indices.
         With ``backend="trtllm-gen"``, the final dimension may use its native
@@ -2985,16 +3009,16 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Per-request physical KV sequence lengths for dense and TRTLLM-GEN
         paths. With DCP these are rank-local lengths and continue to control
         paging, memory bounds, and split-KV. For
-        SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
+        SM89/SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
         flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
         ``None``, every column in ``block_tables`` is active.
     max_seq_len : int
         Maximum physical KV sequence length used for dense/TRTLLM-GEN
         scheduling. With DCP this is the maximum rank-local length.
-        Ignored by the SM120/SM121 sparse v32/GLM backend.
+        Ignored by the SM89/SM120/SM121 sparse v32/GLM backend.
     sparse_mla_top_k : int
         Enables sparse MLA when greater than zero. On SM100/SM103 this selects
-        the TRTLLM-GEN sparse page-table path. On SM120/SM121 with
+        the TRTLLM-GEN sparse page-table path. On SM89/SM120/SM121 with
         ``backend="auto"`` or ``backend="sparse"``, this is the width of the
         packed v32/GLM sparse index matrix. The TRTLLM-GEN backend supports
         dense query input or flattened query input plus ``cum_seq_lens_q``.
@@ -3002,10 +3026,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Output tensor. If not provided, it is allocated internally.
     bmm1_scale : Union[float, torch.Tensor]
         Fused scale for MLA BMM1. TRTLLM-GEN accepts a FP32 tensor or float.
-        CuteDSL, XQA, and SM120/SM121 sparse v32/GLM require a float.
+        CuteDSL, XQA, and SM89/SM120/SM121 sparse v32/GLM require a float.
     bmm2_scale : Union[float, torch.Tensor]
         Fused scale for MLA BMM2. TRTLLM-GEN accepts a FP32 tensor or float.
-        CuteDSL and XQA require a float. SM120/SM121 sparse v32/GLM requires
+        CuteDSL and XQA require a float. SM89/SM120/SM121 sparse v32/GLM requires
         ``1.0``.
     sinks : Optional[List[torch.Tensor]]
         Additional value per head in the denominator of the softmax.
@@ -3027,8 +3051,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Implementation backend. Valid values are ``"auto"``, ``"xqa"``,
         ``"trtllm-gen"``, ``"cute-dsl"``, and ``"sparse"``. ``"auto"``
         chooses ``"trtllm-gen"`` for SM100/SM103 sparse MLA and chooses
-        ``"sparse"`` for SM120/SM121 when ``sparse_mla_top_k > 0``; otherwise
-        SM120/SM121 dense decode uses ``"xqa"``.
+        ``"sparse"`` for SM89/SM120/SM121 when ``sparse_mla_top_k > 0``;
+        otherwise SM89/SM120/SM121 dense decode uses ``"xqa"``.
         For compact variable Q on SM100/SM103, ``"auto"`` keeps TRTLLM-GEN
         when it supports the call and uses monolithic CuTeDSL for TRT gaps or
         LSE output.
@@ -3078,7 +3102,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
           raise :class:`ValueError` if the call uses any modular-only
           feature (e.g. ``sinks``).
     kv_scale_format : str = "auto"
-        Scale semantics for the SM120/SM121 packed v32/GLM sparse backend.
+        Scale semantics for the SM89/SM120/SM121 packed v32/GLM sparse backend.
         ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32 inline
         scales; ``"arbitrary_fp32"`` selects GLM-style arbitrary FP32 inline scales.
         Ignored by the ``trtllm-gen``, ``xqa``, and ``cute-dsl`` backends.
@@ -3221,12 +3245,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
     )
 
-    if backend == "auto":
-        cc = get_compute_capability(query.device)
-        if cc[0] == 12 and sparse_mla_top_k > 0:
-            backend = "sparse"
-        elif cc[0] != 10:
-            backend = "xqa"
+    backend = _resolve_batch_decode_mla_backend(
+        query.device,
+        requested_backend=backend,
+        sparse_mla_top_k=sparse_mla_top_k,
+    )
 
     if backend == "xqa":
         if multi_ctas_kv_counter_buffer is not None:
