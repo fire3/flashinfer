@@ -91,14 +91,14 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                          attn_sink,
                          topk_length_ptr,
                          /*topk_length_extra=*/(const int*)nullptr};
-  // Classic launch: cudaLaunchKernelExC rejects these grid-constant kernels
-  // with invalid argument on SM89 (works on SM120); <<<>>> is portable.
-  kernel<<<grid, block, smem_bytes, stream>>>(Q, KV_cache, indices, attn_sink, output, out_lse,
-                                              cold);
+  cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
+  void* args[] = {(void*)&Q,      (void*)&KV_cache, (void*)&indices, (void*)&attn_sink,
+                  (void*)&output, (void*)&out_lse,  (void*)&cold};
+  CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-// Single-cache MG dispatcher. MG_N_HG_T: 1 lets NUM_HEADS=8/16 use a 16-head
-// CTA (NH=8 is internally padded); 2 is the default for NH >= 32.
+// Single-cache MG dispatcher. MG_N_HG_T: 1 lets NUM_HEADS=16 through MG
+// (HEADS_PER_CTA=16, same shape as SG); 2 is the default for NH >= 32.
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
           int MG_N_HG_T = MG_N_HG_DEFAULT>
 void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
@@ -125,10 +125,10 @@ void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                          attn_sink,
                          topk_length_ptr,
                          /*topk_length_extra=*/(const int*)nullptr};
-  // Classic launch: cudaLaunchKernelExC rejects these grid-constant kernels
-  // with invalid argument on SM89 (works on SM120); <<<>>> is portable.
-  kernel<<<grid, block, smem_bytes, stream>>>(Q, KV_cache, indices, output, out_lse, attn_sink,
-                                              cold);
+  cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
+  void* args[] = {(void*)&Q,       (void*)&KV_cache,  (void*)&indices, (void*)&output,
+                  (void*)&out_lse, (void*)&attn_sink, (void*)&cold};
+  CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
 // Dual-cache MG dispatcher. `topk_extra` is runtime; PAGE_BLOCK_SIZE_EXTRA
@@ -162,10 +162,17 @@ void launch_prefill_mg_dual_fulltile(const bf16* Q, const uint8_t* KV_cache, con
                          attn_sink,
                          /*topk_length=*/(const int*)nullptr,
                          /*topk_length_extra=*/(const int*)nullptr};
-  // Classic launch: cudaLaunchKernelExC rejects these grid-constant kernels
-  // with invalid argument on SM89 (works on SM120); <<<>>> is portable.
-  kernel<<<grid, block, smem_bytes, stream>>>(Q, KV_cache, indices, KV_cache_extra, indices_extra,
-                                              output, out_lse, attn_sink, cold);
+  cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
+  void* args[] = {(void*)&Q,
+                  (void*)&KV_cache,
+                  (void*)&indices,
+                  (void*)&KV_cache_extra,
+                  (void*)&indices_extra,
+                  (void*)&output,
+                  (void*)&out_lse,
+                  (void*)&attn_sink,
+                  (void*)&cold};
+  CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
@@ -191,10 +198,17 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
 
   PrefillColdParams cold{sm_scale,   num_tokens, stride_kv_block, stride_kv_block_extra,
                          topk_extra, attn_sink,  topk_length_ptr, topk_length_extra_ptr};
-  // Classic launch: cudaLaunchKernelExC rejects these grid-constant kernels
-  // with invalid argument on SM89 (works on SM120); <<<>>> is portable.
-  kernel<<<grid, block, smem_bytes, stream>>>(Q, KV_cache, indices, KV_cache_extra, indices_extra,
-                                              output, out_lse, attn_sink, cold);
+  cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
+  void* args[] = {(void*)&Q,
+                  (void*)&KV_cache,
+                  (void*)&indices,
+                  (void*)&KV_cache_extra,
+                  (void*)&indices_extra,
+                  (void*)&output,
+                  (void*)&out_lse,
+                  (void*)&attn_sink,
+                  (void*)&cold};
+  CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
 template <ModelType MT>
@@ -253,8 +267,8 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
       Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
       topk_length_ptr, stream)
 
-// NH=8 and NH=16 share the MG_N_HG_T=1 kernel. NH=8 zero-pads the upper half
-// of the 16-head tile and gates all global Q/sink/output/LSE accesses.
+// NH=16 routes through MG with MG_N_HG_T=1 to avoid SG BF16-QK smem aliasing
+// between Q staging and FP8 weight staging at multi-wave launches.
 #define DISPATCH_BY_NH_CM(CM, TK)       \
   do {                                  \
     switch (num_heads) {                \
@@ -343,7 +357,7 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
   }
 
 // topk_extra is runtime; extra_page_block_size stays template because it
-// changes the KV stride. NH=8/16 use MG_N_HG_T=1; NH=8 is padded internally.
+// changes the KV stride. NH=16 uses MG_N_HG_T=1.
 #define DISPATCH_DUAL_MG_CM(CM, NH, TK, PBSX, NHG)                                                \
   launch_prefill_mg_dual<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, PBSX, NHG>(                \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,      \

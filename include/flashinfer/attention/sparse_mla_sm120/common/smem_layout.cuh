@@ -76,7 +76,7 @@ struct SmemLayout {
   static constexpr size_t SMEM_W_FP8 = SMEM_W_FP8_ONE * CT::N_V_CHUNKS;
 
   // Mbarrier (double-buffered)
-  static constexpr size_t SMEM_MBAR_KV = 4 * sizeof(uint64_t);
+  static constexpr size_t SMEM_MBAR_KV = 2 * sizeof(uint64_t);
 
   // Offsets.
   static constexpr size_t OFF_Q_NOPE = 0;
@@ -125,7 +125,7 @@ struct SmemLayoutMG {
   // q_rope is only needed before the main loop; reuse the W_FP8 region.
   static_assert(N_HG * HPB * D_ROPE * sizeof(bf16) <= SMEM_W_FP8_MG);
   static constexpr size_t SMEM_SCRATCH = 0;
-  static constexpr size_t SMEM_MBAR_KV = 4 * sizeof(uint64_t);
+  static constexpr size_t SMEM_MBAR_KV = 2 * sizeof(uint64_t);
 
   static constexpr size_t OFF_Q_NOPE0 = 0;
   static constexpr size_t OFF_Q_NOPE1 = OFF_Q_NOPE0 + SMEM_Q_NOPE;
@@ -208,9 +208,6 @@ struct SmemPtrsMG {
   __device__ __forceinline__ uint64_t* mbar_kv(int i) const {
     return reinterpret_cast<uint64_t*>(base + LMG::OFF_MBAR_KV) + i;
   }
-  __device__ __forceinline__ uint64_t* mbar_consumed(int i) const {
-    return reinterpret_cast<uint64_t*>(base + LMG::OFF_MBAR_KV) + 2 + i;
-  }
 };
 
 // SG convenience accessor (initialized from smem base pointer)
@@ -233,7 +230,6 @@ struct SmemPtrs {
   float* w_head_sc_all;
   uint8_t* w_fp8;  // base, index by vc * SMEM_W_FP8_ONE
   uint64_t* mbar_kv;
-  uint64_t* mbar_consumed;
 
   __device__ static SmemPtrs init(char* base) {
     SmemPtrs s;
@@ -257,7 +253,6 @@ struct SmemPtrs {
     s.w_head_sc_all = (float*)(base + L::OFF_W_SC_ALL);
     s.w_fp8 = (uint8_t*)(base + L::OFF_W_FP8);
     s.mbar_kv = (uint64_t*)(base + L::OFF_MBAR_KV);
-    s.mbar_consumed = (uint64_t*)(base + L::OFF_MBAR_KV) + 2;
     return s;
   }
 };

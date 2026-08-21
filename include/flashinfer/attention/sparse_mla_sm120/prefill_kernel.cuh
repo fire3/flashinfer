@@ -55,7 +55,7 @@
 // Template params (all constexpr):
 //   MT:              ModelType (DSV3_2 / DSV4)
 //   CM:              ComputeMode (FP8 / BF16) for the QK MMA; XV is always FP8
-//   NUM_HEADS:       8, 16, 32, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates)
+//   NUM_HEADS:       8, 16, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates)
 //   TOPK:            128, 512, 1024, 2048
 //   PAGE_BLOCK_SIZE: 64 (DSV3_2 and DSV4 both use the 64-token page layout)
 // ============================================================================
@@ -119,8 +119,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
   if (threadIdx.x == 0) {
     mbarrier_init(sm.mbar_kv + 0, 1);
     mbarrier_init(sm.mbar_kv + 1, 1);
-    mbarrier_init(sm.mbar_consumed + 0, 1);
-    mbarrier_init(sm.mbar_consumed + 1, 1);
   }
   bar_sync_t<3, BLOCK_THREADS>();
 
@@ -150,16 +148,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
       if (ti + 1 < actual_ni) {
-        // Wait for the PREVIOUS occupant of this buffer (tile ti-1, consumed by
-        // math) before overwriting it. mbar_consumed[b] starts at phase 0 and
-        // flips once per consumption (tiles b, b+2, ...); the phase that
-        // completes with the (T>>1)-th arrival has parity ((T>>1)-1)&1, i.e.
-        // ((T>>1)+1)&1 with T = ti+1 => ((ti+3)>>1)&1. Using ((ti+1)>>1)&1
-        // waits one completion too late: on the first prefetch it blocks on a
-        // fresh barrier until the tile being issued is consumed (deadlock).
-        const int next_phase = ((ti + 3) >> 1) & 1;
-        mbarrier_wait_parity(sm.mbar_consumed + ((ti + 1) & 1), next_phase);
-
         io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_bufs[(ti + 1) & 1],
                                               idx_base + (ti + 1) * BI, KV_cache, io_tid,
                                               stride_kv_block);
@@ -168,7 +156,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
             sm.kv_bufs[(ti + 1) & 1], idx_base + (ti + 1) * BI, KV_cache,
             sm.mbar_kv + ((ti + 1) & 1), io_tid, stride_kv_block, kv_l2_policy);
       }
-      // SM89: mbar_consumed + mbar_kv handle all sync
+      bar_sync_t<1, BLOCK_THREADS>();
     }
 
     // ── Math warps ──────────────────────────────────────────────────
@@ -535,20 +523,15 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                                          stride_kv_block, reinterpret_cast<bf16*>(sm.w_fp8));
       }
 
-#if SPARSE_MLA_USE_SM89_PRIMS
-      // SM89: signal IO that this buffer has been consumed, using mbarrier
-      // instead of CTA barrier (SM89 barrier immediate-count is unreliable).
-      if (threadIdx.x == 0) mbarrier_arrive(sm.mbar_consumed + (ti & 1));
-#else
       bar_arrive_t<1, BLOCK_THREADS>();
-#endif
       if (ti + 1 < actual_ni) {
         const int next_phase = ((ti + 1) >> 1) & 1;
         mbarrier_wait_parity(sm.mbar_kv + ((ti + 1) & 1), next_phase);
-        // mbarrier wait has no implicit memory fence (see decode_dsv3_2 note):
-        // CTA-wide acquire so this tile's smem writes are visible to all math
-        // threads before the next iteration reads kv_smem.
+#if SPARSE_MLA_USE_SM89_PRIMS
+        // SM89: CTA-wide acq-rel after the mbarrier wait before reading the
+        // newly loaded kv_smem (same pattern as decode-dsv3_2/decode-dsv4).
         bar_sync_t<2, MATH_THREADS>();
+#endif
       }
     }
 
@@ -652,8 +635,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 //
 // MG_N_HG_T = 2 (HEADS_PER_CTA=32): NUM_HEADS in {32,64,128}, KV reused across
 //             both groups (2× reuse, deferred row_sum, higher MMA utilization).
-// MG_N_HG_T = 1 (HEADS_PER_CTA=16): NUM_HEADS in {8,16}; NH=8 zero-pads the
-//             upper 8 rows and gates all global reads/writes.
+// MG_N_HG_T = 1 (HEADS_PER_CTA=16): NUM_HEADS=16, used wherever SG cannot
+//             apply (e.g. dual-cache, which SG doesn't support).
 // ============================================================================
 
 // SmemLayoutMG / SmemPtrsMG are parameterised on the default MG_N_HG=2 layout;
@@ -706,6 +689,9 @@ __device__ __forceinline__ void prefill_mg_impl(
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
                 "NUM_HEADS must fill MG_HEADS_PER_CTA, except a single padded head group");
   static constexpr int REPLICATE_H = (NUM_HEADS + MG_HEADS_PER_CTA - 1) / MG_HEADS_PER_CTA;
+  // smem layout always allocates HPB heads per group (zero-padded for invalid
+  // slots); Q load and BF16 output / LSE write-back are gated by VALID_HPB to
+  // avoid reading/writing past the caller's [num_tokens, NUM_HEADS, ...] buffers.
   static constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
   static constexpr int QK_NOPE_KSTEPS = KV::QUANT_TILE / 32;
   static constexpr bool USE_WFP8_ROW_XOR = DUAL_CACHE && (PAGE_BLOCK_SIZE_EXTRA == 2);
@@ -754,8 +740,6 @@ __device__ __forceinline__ void prefill_mg_impl(
   if (threadIdx.x == 0) {
     mbarrier_init(sm.mbar_kv(0), 1);
     mbarrier_init(sm.mbar_kv(1), 1);
-    mbarrier_init(sm.mbar_consumed(0), 1);
-    mbarrier_init(sm.mbar_consumed(1), 1);
   }
   bar_sync_t<3, BLOCK_THREADS>();
 
@@ -782,10 +766,6 @@ __device__ __forceinline__ void prefill_mg_impl(
 #pragma unroll 1
       for (int ti = 0; ti < loop_bound; ti++) {
         if (ti + 1 < loop_bound) {
-          // See SG path: wait for the previous occupant (tile ti-1) of this
-          // buffer, not for the phase that completes when tile ti+1 is consumed.
-          const int next_phase = ((ti + 3) >> 1) & 1;
-          mbarrier_wait_parity(sm.mbar_consumed((ti + 1) & 1), next_phase);
           if constexpr (DUAL_CACHE) {
             const bool next_main = (ti + 1) < NI;
             const int32_t* next_idx =
@@ -816,7 +796,7 @@ __device__ __forceinline__ void prefill_mg_impl(
                                                            io_tid, stride_kv_block, kv_l2_policy);
           }
         }
-        // SM89: mbar_consumed + mbar_kv handle all sync
+        bar_sync_t<1, BLOCK_THREADS>();
       }
     } else {
       auto issue_tile = [&](int logical_ti, int buf) {
@@ -855,13 +835,9 @@ __device__ __forceinline__ void prefill_mg_impl(
 #pragma unroll 1
       for (int ti = 0; ti < loop_bound; ti++) {
         if (ti + 1 < loop_bound) {
-          // See SG path: wait for the previous occupant (tile ti-1) of this
-          // buffer, not for the phase that completes when tile ti+1 is consumed.
-          const int next_phase = ((ti + 3) >> 1) & 1;
-          mbarrier_wait_parity(sm.mbar_consumed((ti + 1) & 1), next_phase);
           issue_tile(ti + 1, (ti + 1) & 1);
         }
-        // SM89: mbar_consumed + mbar_kv handle all sync
+        bar_sync_t<1, BLOCK_THREADS>();
       }
     }
 
@@ -1554,18 +1530,15 @@ __device__ __forceinline__ void prefill_mg_impl(
                                                        reinterpret_cast<bf16*>(sm.w_fp8()));
         }
       }
-#if SPARSE_MLA_USE_SM89_PRIMS
-      // SM89: signal IO that this buffer has been consumed, using mbarrier.
-      if (threadIdx.x == 0) mbarrier_arrive(sm.mbar_consumed(ti & 1));
-#else
       bar_arrive_t<1, BLOCK_THREADS>();
-#endif
       if (ti + 1 < loop_bound) {
         const int next_phase = ((ti + 1) >> 1) & 1;
         mbarrier_wait_parity(sm.mbar_kv((ti + 1) & 1), next_phase);
-        // mbarrier wait has no implicit memory fence (see decode_dsv3_2 note):
-        // CTA-wide acquire before the next iteration reads kv_smem.
+#if SPARSE_MLA_USE_SM89_PRIMS
+        // SM89: CTA-wide acq-rel after the mbarrier wait before reading the
+        // newly loaded kv_smem (same pattern as decode-dsv3_2/decode-dsv4).
         bar_sync_t<2, MATH_THREADS>();
+#endif
       }
     }
 
