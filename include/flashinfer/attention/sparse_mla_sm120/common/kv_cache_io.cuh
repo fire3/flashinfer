@@ -92,10 +92,17 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
       cp_async_bulk_g2s(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar);
   }
 #if SPARSE_MLA_USE_SM89_PRIMS
-  // SM89: expect_tx is a no-op and cp.async.mbarrier.arrive.noinc traps in
-  // this context, so fall back to the decode-style completion: wait for the
-  // IO threads' copies, sync the IO threads, then arrive once (count=1).
-  cp_async_wait_all();
+  // SM89: expect_tx is a no-op (sm_90+) and the plain cp.async emulation has
+  // no mbarrier tx tracking, so the copies must be tied to the barrier
+  // explicitly. Each IO thread issues cp.async.mbarrier.arrive (non-noinc,
+  // zero-net on the pending count) so its own prior cp.async writes are made
+  // visible to the acquiring math wait (PTX ISA §mbarrier.test_wait/try_wait,
+  // acquire-ordering item 2). The IO-wide named barrier orders every lane's
+  // arrive-on increments (and the scalar scale stores gathered earlier) before
+  // the single completing mbarrier_arrive below, so mbarrier init count stays
+  // 1. No cp.async.wait_all is needed: the barrier phase cannot complete
+  // before every tracked copy has finished.
+  cp_async_mbarrier_arrive(mbar);
   bar_sync_t<4, IO_THREADS>();
   if (io_tid == 0) mbarrier_arrive(mbar);
 #endif

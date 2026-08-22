@@ -71,10 +71,34 @@ __device__ __forceinline__ void cp_async_mbarrier_arrive_noinc(uint64_t* mbar) {
   asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(addr) : "memory");
 }
 
+// cp.async.mbarrier.arrive: binds every prior cp.async copy issued by THIS
+// thread to the mbarrier — upon completion of those copies the barrier's
+// pending count is decremented (an arrive-on). Without .noinc the pending
+// count is first incremented by 1, so the operation is zero-net on the
+// count: it is a *visibility carrier* for the copies, not the completing
+// arrival. The phase still completes via one thread's plain mbarrier_arrive
+// (release), matching PTX ISA Example 1 — the mbarrier init count must only
+// account for that completing arrival.
+//
+// This is the SM80/89 substitute for SM90+ TMA tx-count tracking: PTX ISA
+// §mbarrier.test_wait/try_wait acquire-ordering item 2 guarantees that all
+// cp.async operations requested prior to cp.async.mbarrier.arrive are
+// performed and made visible to the acquiring waiter. A plain release
+// mbarrier.arrive alone does NOT cover cp.async writes (they are async-proxy
+// operations, excluded from item 1), and fence.proxy.async requires sm_90+.
+__device__ __forceinline__ void cp_async_mbarrier_arrive(uint64_t* mbar) {
+  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+  asm volatile("cp.async.mbarrier.arrive.shared::cta.b64 [%0];\n" ::"r"(addr) : "memory");
+}
+
 // cp.async.bulk: SM90+ bulk global → shared (mbarrier-based completion)
 __device__ __forceinline__ void cp_async_bulk_g2s(void* smem_dst, const void* gmem_src,
                                                   uint32_t bytes, uint64_t* mbar) {
 #if SPARSE_MLA_USE_SM89_PRIMS
+  // SM89: no cp.async.bulk / expect_tx. Emulate with 16B cp.async chunks.
+  // Callers must follow the gather with cp_async_mbarrier_arrive() (per
+  // issuing thread) + one mbarrier_arrive() so the math side's acquire sees
+  // the copies (see kv_cache_io.cuh / decode_dsv4 issue_gather).
   (void)mbar;
 #pragma unroll
   for (uint32_t off = 0; off < bytes; off += 16) {
@@ -96,6 +120,8 @@ __device__ __forceinline__ void cp_async_bulk_g2s_l2hint(void* smem_dst, const v
                                                          uint32_t bytes, uint64_t* mbar,
                                                          uint64_t cache_policy) {
 #if SPARSE_MLA_USE_SM89_PRIMS
+  // SM89: same 16B cp.async emulation as cp_async_bulk_g2s; the L2 hint has
+  // no SM89 form (see cp_async_16B_l2), so it is dropped.
   (void)mbar;
   (void)cache_policy;
 #pragma unroll

@@ -32,11 +32,12 @@ namespace flashinfer::sparse_mla_sm120 {
 // scales in one go (528 B), then a second bulk for rope (128 B). No scalar
 // scale gather phase.
 //
-// Mbarrier pattern matches decode-dsv4: mbar_full[s] for IO→math (leader
-// arrives with expect_tx, bulk completion decrements tx), mbar_empty[s]
-// for math→IO drain. CTA-wide acq-rel sync (bar_sync<3, MATH_THREADS>)
-// after mbarrier_wait_parity is required since the mbarrier wait has no
-// implicit memory fence.
+// Mbarrier pattern matches decode-dsv4: mbar_full[s] for IO→math (SM120:
+// leader arrives with expect_tx, bulk completion decrements tx; SM89: per-lane
+// cp.async.mbarrier.arrive + one completing release arrive), mbar_empty[s]
+// for math→IO drain. test_wait/try_wait.parity defaults to acquire (PTX ISA);
+// bar_sync<3, MATH_THREADS> after the wait synchronizes math warps with each
+// other (it is NOT the cross-side fence — IO warps do not participate).
 
 constexpr int DSV3_2_N_WARPS = 8;  // math warps
 constexpr int DSV3_2_IO_WARPS = 1;
@@ -257,9 +258,14 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
                         V2_BULK_ROPE_BYTES, sm.mbar_full(buf));
     }
 #if SPARSE_MLA_USE_SM89_PRIMS
-    // cp.async emulation has no mbarrier tx tracking: wait for the IO warp's
-    // copies, then arrive once so the math side can proceed.
-    cp_async_wait_all();
+    // SM89: cp.async emulation has no mbarrier tx tracking. Each lane ties
+    // its own copies to the barrier via cp.async.mbarrier.arrive (non-noinc,
+    // zero-net pending count) — the acquiring math wait then sees them (PTX
+    // ISA acquire-ordering item 2). The IO-wide bar orders all lanes'
+    // arrive-on increments before the single completing release arrive;
+    // mbarrier init count stays 1. No cp.async.wait_all is needed: the
+    // barrier phase cannot complete before every copy finishes.
+    cp_async_mbarrier_arrive(sm.mbar_full(buf));
     bar_sync_t<4, DSV3_2_IO_THREADS>();
     if (lane == 0) {
       mbarrier_arrive(sm.mbar_full(buf));

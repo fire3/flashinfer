@@ -22,14 +22,19 @@ namespace flashinfer::sparse_mla_sm120 {
 // buffers; math warps consume. Each warp covers DSV4_BI/8 candidates and
 // V_CHUNK/8 V-dims so per-thread acc_nope stays in registers.
 //
-// Per-buf mbarrier pairs: mbar_full[s] for IO→math (leader arrives with
-// expect_tx, bulk completion decrements tx), mbar_empty[s] for math→IO
-// drain (one math signaling thread arrives at end-of-iter).
+// Per-buf mbarrier pairs: mbar_full[s] for IO→math (SM120: leader arrives
+// with expect_tx, bulk completion decrements tx; SM89: per-lane
+// cp.async.mbarrier.arrive + one completing release arrive), mbar_empty[s]
+// for math→IO drain (one math signaling thread arrives at end-of-iter).
 //
-// IMPORTANT: mbarrier.try_wait.parity has no implicit memory fence — the
-// consumer must follow it with a CTA-wide acq-rel sync before reading
-// smem, otherwise non-leader IO writes can be stale. We use
-// bar_sync<3, MATH_THREADS> since only math warps participate.
+// Memory model: mbarrier.arrive defaults to .release and
+// test_wait/try_wait.parity defaults to .acquire (PTX ISA), so after a True
+// wait the IO side's writes — generic accesses (scales) AND cp.async copies
+// tied to the barrier via cp.async.mbarrier.arrive — are visible to the
+// waiting math thread. The bar_sync<3, MATH_THREADS> after the wait is NOT
+// the cross-side fence (IO warps do not participate in it); it synchronizes
+// math warps with each other before smem that is shared across math warps
+// (reduce buffers, sm_p_full) is reused.
 
 constexpr int DSV4_N_WARPS = 8;  // math warps
 constexpr int DSV4_IO_WARPS = 1;
@@ -311,9 +316,14 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
                         DSV4_BULK_ROPE_BYTES, sm.mbar_full(buf));
     }
 #if SPARSE_MLA_USE_SM89_PRIMS
-    // cp.async emulation has no mbarrier tx tracking: wait for the IO warp's
-    // copies, then arrive once so the math side can proceed.
-    cp_async_wait_all();
+    // SM89: cp.async emulation has no mbarrier tx tracking. Each lane ties
+    // its own copies to the barrier via cp.async.mbarrier.arrive (non-noinc,
+    // zero-net pending count) — the acquiring math wait then sees them (PTX
+    // ISA acquire-ordering item 2). The IO-wide bar orders all lanes'
+    // arrive-on increments (and the scale stores) before the single completing
+    // release arrive; mbarrier init count stays 1. No cp.async.wait_all is
+    // needed: the barrier phase cannot complete before every copy finishes.
+    cp_async_mbarrier_arrive(sm.mbar_full(buf));
     bar_sync_t<4, DSV4_IO_THREADS>();
     if (lane == 0) {
       mbarrier_arrive(sm.mbar_full(buf));
@@ -374,11 +384,13 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     const int split_cand_start = chunk_in_section * DSV4_CAND_WINDOW;
     const int split_cand_end = min(split_cand_start + DSV4_CAND_WINDOW, section_len);
 
-    // Wait for IO to fill this buf (mbar_full tx + arrival both met).
+    // Wait for IO to fill this buf (mbar_full phase complete).
     mbarrier_wait_parity(sm.mbar_full(cons_idx), cons_phase);
-    // CTA-wide acquire after mbar wake. Without this, math reads see only
-    // the view released by whichever IO thread triggered the phase flip —
-    // other IO lanes' writes (e.g., last-head RoPE bytes) may be stale.
+    // test_wait.parity defaults to acquire (PTX ISA), so the IO side's release
+    // arrive + cp.async.mbarrier.arrive (SM89) / bulk tx (SM120) are already
+    // visible here. The math-wide bar is not the cross-side fence (IO warps
+    // do not participate); it makes all math warps proceed uniformly before
+    // smem shared across math warps (reduce buffers, sm_p_full) is reused.
     bar_sync_t<3, DSV4_MATH_THREADS>();
 
     uint8_t* sm_kv_fp8 = sm.kv_fp8(buf);

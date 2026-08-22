@@ -52,6 +52,12 @@ __device__ __forceinline__ void mbarrier_inval(uint64_t* mbar) {
   asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" ::"r"(addr));
 }
 
+// mbarrier.arrive (no .sem qualifier) DEFAULTS TO .release (PTX ISA
+// §mbarrier.arrive: "If the .sem qualifier is absent, .release is assumed by
+// default"). Generic-proxy accesses requested before this arrive are made
+// visible to a thread whose test_wait/try_wait on the same phase returns
+// True. cp.async writes are NOT covered by this path — they need
+// cp.async.mbarrier.arrive (see cp_async.cuh) or SM90+ bulk tx tracking.
 __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
   asm volatile(
@@ -60,6 +66,10 @@ __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
       "}\n" ::"r"(addr));
 }
 
+// mbarrier.arrive.expect_tx: sm_90+ only. On SM89 it is a no-op — there is no
+// TMA/async-proxy tx-count to attach, so the SM89 callers instead tie their
+// cp.async copies to the barrier via cp_async_mbarrier_arrive() and complete
+// the phase with mbarrier_arrive().
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
 #if SPARSE_MLA_USE_SM89_PRIMS
   (void)mbar;
@@ -74,6 +84,12 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32
 #endif
 }
 
+// test_wait / try_wait.parity (no .sem qualifier) DEFAULTS TO .acquire (PTX
+// ISA §mbarrier.test_wait/try_wait). On a True return, the wait acquires:
+//   1. generic accesses prior to a release arrive in the completed phase,
+//   2. cp.async ops prior to cp.async.mbarrier.arrive in the completed phase,
+//   3. cp.async.bulk ops tracked on the same mbarrier.
+// SM89 uses test_wait (requires sm_80+); SM90+ uses try_wait (sm_90+).
 __device__ __forceinline__ void mbarrier_wait_parity(uint64_t* mbar, uint32_t phase) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
   uint32_t done = 0;

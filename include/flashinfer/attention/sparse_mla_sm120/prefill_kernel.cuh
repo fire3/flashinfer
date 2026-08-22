@@ -194,8 +194,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     if (actual_ni > 0) {
       mbarrier_wait_parity(sm.mbar_kv + 0, 0);
 #if SPARSE_MLA_USE_SM89_PRIMS
-      // SM89: CTA-wide acq-rel after the mbarrier wait (same pattern as the
-      // main-loop waits and decode kernels) before reading kv_smem[0].
+      // SM89: math-wide sync after the mbarrier wait. The data ordering
+      // IO→math comes from test_wait.parity's default acquire + the IO side's
+      // release arrive (with cp.async.mbarrier.arrive tying the copies);
+      // this bar only makes all math warps proceed uniformly before reading
+      // kv_smem[0] (IO warps do not participate).
       bar_sync_t<2, MATH_THREADS>();
 #endif
     }
@@ -543,8 +546,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
         const int next_phase = ((ti + 1) >> 1) & 1;
         mbarrier_wait_parity(sm.mbar_kv + ((ti + 1) & 1), next_phase);
 #if SPARSE_MLA_USE_SM89_PRIMS
-        // SM89: CTA-wide acq-rel after the mbarrier wait before reading the
-        // newly loaded kv_smem (same pattern as decode-dsv3_2/decode-dsv4).
+        // SM89: math-wide sync after the mbarrier wait (data ordering comes
+        // from the mbarrier release/acquire pair; see the prologue comment).
         bar_sync_t<2, MATH_THREADS>();
 #endif
       }
