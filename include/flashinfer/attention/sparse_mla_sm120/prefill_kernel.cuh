@@ -191,7 +191,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     float warp_l[2] = {0.f, 0.f};
 
     bar_sync_t<2, MATH_THREADS>();
-    if (actual_ni > 0) mbarrier_wait_parity(sm.mbar_kv + 0, 0);
+    if (actual_ni > 0) {
+      mbarrier_wait_parity(sm.mbar_kv + 0, 0);
+#if SPARSE_MLA_USE_SM89_PRIMS
+      // SM89: CTA-wide acq-rel after the mbarrier wait (same pattern as the
+      // main-loop waits and decode kernels) before reading kv_smem[0].
+      bar_sync_t<2, MATH_THREADS>();
+#endif
+    }
 
 // ── Main loop — QK + softmax + XV ───────────────────────────
 #pragma unroll 1
@@ -899,8 +906,20 @@ __device__ __forceinline__ void prefill_mg_impl(
     bar_sync_t<2, MATH_THREADS>();
     if constexpr (ASSUME_FULL_TILES) {
       mbarrier_wait_parity(sm.mbar_kv(0), 0);
+#if SPARSE_MLA_USE_SM89_PRIMS
+      // SM89: CTA-wide acq-rel after the mbarrier wait (same pattern as the
+      // main-loop waits and decode kernels) before reading kv_smem[0].
+      bar_sync_t<2, MATH_THREADS>();
+#endif
     } else {
-      if (loop_bound > 0) mbarrier_wait_parity(sm.mbar_kv(0), 0);
+      if (loop_bound > 0) {
+        mbarrier_wait_parity(sm.mbar_kv(0), 0);
+#if SPARSE_MLA_USE_SM89_PRIMS
+        // SM89: CTA-wide acq-rel after the mbarrier wait (same pattern as the
+        // main-loop waits and decode kernels) before reading kv_smem[0].
+        bar_sync_t<2, MATH_THREADS>();
+#endif
+      }
     }
 
     // ── Main loop ───────────────────────────────────────────────
