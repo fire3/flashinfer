@@ -392,6 +392,14 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 #pragma unroll
       for (int blk = 0; blk < NUM_SCALES; blk++) {
         uint8_t sfa = fp32_to_ue8m0(sm.q_sc()[(gid + (lane & 1) * 8) * NUM_SCALES + blk]);
+#if SPARSE_MLA_USE_SM89_PRIMS
+        // DSV4_QK_N_TILES == 1: the B scale is loop-invariant across ks, so
+        // prepare the four per-accumulator factors once per scale block.
+        static_assert(DSV4_QK_N_TILES == 1);
+        const int cand_row_base = warp_first_cand;
+        uint8_t sfb = sm_kv_sc[(cand_row_base + gid) * SCALE_BYTES_PER_TOKEN + blk];
+        MmaFp8Scale sc = prepare_block_scale(sfa, sfb);
+#endif
 #pragma unroll
         for (int ks = 0; ks < QUANT_TILE / 32; ks++) {
           const int ko = blk * QUANT_TILE + ks * 32;
@@ -400,12 +408,20 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 #pragma unroll
           for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
             const int cand_row_base = warp_first_cand + nt * 8;
+#if SPARSE_MLA_USE_SM89_PRIMS
+            uint32_t b0, b1;
+            ldmatrix_load_B_fp8(b0, b1, sm_kv_fp8 + (size_t)cand_row_base * KV_SMEM_STRIDE + ko,
+                                KV_SMEM_STRIDE, lane);
+            MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, qk[nt][0],
+                                                           qk[nt][1], qk[nt][2], qk[nt][3], sc);
+#else
             uint8_t sfb = sm_kv_sc[(cand_row_base + gid) * SCALE_BYTES_PER_TOKEN + blk];
             uint32_t b0, b1;
             ldmatrix_load_B_fp8(b0, b1, sm_kv_fp8 + (size_t)cand_row_base * KV_SMEM_STRIDE + ko,
                                 KV_SMEM_STRIDE, lane);
             MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(
                 a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3], sfa, sfb);
+#endif
             qk[nt][0] = r.d0;
             qk[nt][1] = r.d1;
             qk[nt][2] = r.d2;

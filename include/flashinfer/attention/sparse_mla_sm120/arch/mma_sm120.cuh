@@ -70,26 +70,59 @@ __device__ __forceinline__ MmaFp8Result mma_fp8_m16n8k32(uint32_t a0, uint32_t a
   return r;
 }
 
+#if SPARSE_MLA_USE_SM89_PRIMS
+// ── SM89-only software block-scale path ─────────────────────────────────────
+// Combines the per-lane ue8m0 row/column scales into the four per-accumulator
+// factors. The shuffles below are the only warp-wide traffic of the
+// software-scale path, so prepare once per (scale_a, scale_b) and reuse across
+// K/N tiles.
+//
+// Lane contract (see tests/attention/sm89_soft_scale_mma_test.cu):
+//   scale_a(lane) = ue8m0(A row (lane>>2) + ((lane & 1) << 3))   -- valid on all lanes
+//   scale_b(lane) = ue8m0(B column (lane>>2))                    -- sb0/sb1 read tid==0 lanes
+struct MmaFp8Scale {
+  // s00=(row g, col 2t), s01=(row g, col 2t+1), s10=(row g+8, col 2t),
+  // s11=(row g+8, col 2t+1), matching the m16n8k32 accumulator layout.
+  float s00, s01, s10, s11;
+};
+
+__device__ __forceinline__ MmaFp8Scale prepare_block_scale(uint8_t scale_a, uint8_t scale_b) {
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t quad_base = lane & ~3u;
+  const uint32_t col_pair = lane & 3u;
+
+  // Every lane already holds the scale of one of the two rows its accumulator
+  // touches, so one shuffle (+ select) replaces the two A shuffles.
+  const uint32_t sa_own = static_cast<uint32_t>(scale_a);
+  const uint32_t sa_peer = __shfl_sync(0xffffffffu, sa_own, quad_base + ((lane & 1u) ^ 1u));
+  const uint32_t sa0 = (lane & 1u) ? sa_peer : sa_own;
+  const uint32_t sa1 = (lane & 1u) ? sa_own : sa_peer;
+
+  const uint32_t sb0 = __shfl_sync(0xffffffffu, static_cast<uint32_t>(scale_b), col_pair * 8u);
+  const uint32_t sb1 =
+      __shfl_sync(0xffffffffu, static_cast<uint32_t>(scale_b), col_pair * 8u + 4u);
+
+  return {multiply_ue8m0(sa0, sb0), multiply_ue8m0(sa0, sb1), multiply_ue8m0(sa1, sb0),
+          multiply_ue8m0(sa1, sb1)};
+}
+
+// Block-scaled MMA with a precomputed scale pair (SM89 only). Accumulates the
+// plain m16n8k32 product scaled by the four factors into C.
+__device__ __forceinline__ MmaFp8Result mma_fp8_block_scaled_m16n8k32(
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1, float c0,
+    float c1, float c2, float c3, const MmaFp8Scale& scale) {
+  MmaFp8Result mma = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, 0.f, 0.f, 0.f, 0.f);
+  return {fmaf(mma.d0, scale.s00, c0), fmaf(mma.d1, scale.s01, c1), fmaf(mma.d2, scale.s10, c2),
+          fmaf(mma.d3, scale.s11, c3)};
+}
+#endif
+
 __device__ __forceinline__ MmaFp8Result mma_fp8_block_scaled_m16n8k32(
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1, float c0,
     float c1, float c2, float c3, uint8_t scale_a, uint8_t scale_b) {
 #if SPARSE_MLA_USE_SM89_PRIMS
-  MmaFp8Result mma = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, 0.f, 0.f, 0.f, 0.f);
-  const int lane = threadIdx.x & 31;
-  const int quad_base = lane & ~3;
-  const int col_pair = lane & 3;
-
-  const uint32_t sa0 = __shfl_sync(0xffffffff, static_cast<uint32_t>(scale_a), quad_base);
-  const uint32_t sa1 = __shfl_sync(0xffffffff, static_cast<uint32_t>(scale_a), quad_base + 1);
-  const uint32_t sb0 = __shfl_sync(0xffffffff, static_cast<uint32_t>(scale_b), col_pair * 8);
-  const uint32_t sb1 = __shfl_sync(0xffffffff, static_cast<uint32_t>(scale_b), col_pair * 8 + 4);
-
-  return MmaFp8Result{
-      fmaf(mma.d0, multiply_ue8m0(sa0, sb0), c0),
-      fmaf(mma.d1, multiply_ue8m0(sa0, sb1), c1),
-      fmaf(mma.d2, multiply_ue8m0(sa1, sb0), c2),
-      fmaf(mma.d3, multiply_ue8m0(sa1, sb1), c3),
-  };
+  return mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3,
+                                       prepare_block_scale(scale_a, scale_b));
 #else
   MmaFp8Result r;
   asm volatile(

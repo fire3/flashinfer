@@ -338,6 +338,9 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
           const uint8_t* k_scale_base =
               sm_kv_fp8 + (size_t)(cand_row_base + gid) * KV_SMEM_STRIDE + D_NOPE;
           uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
+#if SPARSE_MLA_USE_SM89_PRIMS
+          MmaFp8Scale sc = prepare_block_scale(sfa, sfb);
+#endif
 #pragma unroll
           for (int ks = 0; ks < QUANT_TILE / 32; ks++) {
             const int ko = blk * QUANT_TILE + ks * 32;
@@ -345,8 +348,13 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
             ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_fp8() + ko, Q_NOPE_STRIDE, lane);
             ldmatrix_load_B_fp8(b0, b1, sm_kv_fp8 + (size_t)cand_row_base * KV_SMEM_STRIDE + ko,
                                 KV_SMEM_STRIDE, lane);
+#if SPARSE_MLA_USE_SM89_PRIMS
+            MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1,
+                                                           acc2, acc3, sc);
+#else
             MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1, acc2,
                                                            acc3, sfa, sfb);
+#endif
             acc0 = r.d0;
             acc1 = r.d1;
             acc2 = r.d2;

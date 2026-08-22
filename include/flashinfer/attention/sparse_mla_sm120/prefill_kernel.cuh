@@ -281,6 +281,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
             k_scale_base = sm.kv_scale_bufs[ti & 1] + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
           }
           uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
+#if SPARSE_MLA_USE_SM89_PRIMS
+          MmaFp8Scale sc = prepare_block_scale(sfa, sfb);
+#endif
 
 #pragma unroll
           for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
@@ -288,8 +291,13 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
             uint32_t a0, a1, a2, a3, b0, b1;
             ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_nope_fp8 + ko, KV::Q_NOPE_STRIDE, lane);
             ldmatrix_load_B_fp8(b0, b1, kv_warp_base + ko, KV::KV_SMEM_STRIDE, lane);
+#if SPARSE_MLA_USE_SM89_PRIMS
+            MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1,
+                                                           acc2, acc3, sc);
+#else
             MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1, acc2,
                                                            acc3, sfa, sfb);
+#endif
             acc0 = r.d0;
             acc1 = r.d1;
             acc2 = r.d2;
@@ -1152,14 +1160,22 @@ __device__ __forceinline__ void prefill_mg_impl(
                 k_scale_base = sm.kv_scale_buf(ti & 1) + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
               }
               uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
+#if SPARSE_MLA_USE_SM89_PRIMS
+              MmaFp8Scale sc = prepare_block_scale(sfa, sfb);
+#endif
 #pragma unroll
               for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
                 int ko = blk * KV::QUANT_TILE + ks * 32;
                 uint32_t a0, a1, a2, a3, b0, b1;
                 ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_nope_fp8(g) + ko, KV::Q_NOPE_STRIDE, lane);
                 ldmatrix_load_B_fp8(b0, b1, kv_warp_base + ko, KV::KV_SMEM_STRIDE, lane);
+#if SPARSE_MLA_USE_SM89_PRIMS
+                MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1,
+                                                               acc2, acc3, sc);
+#else
                 MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1,
                                                                acc2, acc3, sfa, sfb);
+#endif
                 acc0 = r.d0;
                 acc1 = r.d1;
                 acc2 = r.d2;
