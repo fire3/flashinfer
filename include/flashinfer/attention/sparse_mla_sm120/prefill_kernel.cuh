@@ -541,7 +541,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                                          stride_kv_block, reinterpret_cast<bf16*>(sm.w_fp8));
       }
 
+#if SPARSE_MLA_USE_SM89_PRIMS
+      // SM89: blocking WAR release for kv_bufs reuse — math must not signal
+      // consumption (and let IO overwrite the buffer) while its smem reads
+      // are still in flight. SM120 keeps the non-blocking bar.arrive.
+      bar_sync_t<1, BLOCK_THREADS>();
+#else
       bar_arrive_t<1, BLOCK_THREADS>();
+#endif
       if (ti + 1 < actual_ni) {
         const int next_phase = ((ti + 1) >> 1) & 1;
         mbarrier_wait_parity(sm.mbar_kv + ((ti + 1) & 1), next_phase);
@@ -1568,7 +1575,12 @@ __device__ __forceinline__ void prefill_mg_impl(
                                                        reinterpret_cast<bf16*>(sm.w_fp8()));
         }
       }
+#if SPARSE_MLA_USE_SM89_PRIMS
+      // SM89: blocking WAR release for kv_bufs reuse (see SG kernel above).
+      bar_sync_t<1, BLOCK_THREADS>();
+#else
       bar_arrive_t<1, BLOCK_THREADS>();
+#endif
       if (ti + 1 < loop_bound) {
         const int next_phase = ((ti + 1) >> 1) & 1;
         mbarrier_wait_parity(sm.mbar_kv((ti + 1) & 1), next_phase);
